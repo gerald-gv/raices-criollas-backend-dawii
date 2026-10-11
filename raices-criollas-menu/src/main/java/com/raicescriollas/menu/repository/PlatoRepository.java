@@ -1,5 +1,7 @@
 package com.raicescriollas.menu.repository;
 
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -24,7 +26,7 @@ public interface PlatoRepository extends JpaRepository<Plato, Long> {
      * si se pasa null se ignora ese filtro.
      * Siempre filtra plato disponible y categoria activa.
      */
-    @Query("""
+       @Query("""
             SELECT p FROM Plato p
             JOIN p.categoria c
             WHERE p.disponible = true
@@ -43,4 +45,18 @@ public interface PlatoRepository extends JpaRepository<Plato, Long> {
             @Param("precioMax") BigDecimal precioMax
     );
     Optional<Plato> findByIdAndDisponibleTrue(Long id);
+    Page<Plato> findAll(Pageable pageable);
+
+    /** Platos marcados como destacados, disponibles y con categoria activa (para la home). */
+    @Query("""
+            SELECT p FROM Plato p
+            JOIN p.categoria c
+            WHERE p.destacado = true
+              AND p.disponible = true
+              AND c.activo = true
+            ORDER BY p.id ASC
+            """)
+    List<Plato> findDestacados();
+
+    long countByDestacadoTrue();
 }
