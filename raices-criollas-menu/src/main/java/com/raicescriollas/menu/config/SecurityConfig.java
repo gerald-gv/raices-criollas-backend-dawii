@@ -39,6 +39,7 @@ public class SecurityConfig {
             	        "/categorias/activas",
             	        "/categorias/*",
             	        "/platos/disponibles",
+            	        "/platos/destacados",
             	        "/platos/*"
             	    ).permitAll()
 
@@ -50,7 +51,6 @@ public class SecurityConfig {
             	        "/platos",
             	        "/platos/admin/**"
             	    ).hasAuthority("ROLE_ADMIN")
-
             	    // Todo lo demas requiere admin
             	    .anyRequest()
             	        .hasAuthority("ROLE_ADMIN")
