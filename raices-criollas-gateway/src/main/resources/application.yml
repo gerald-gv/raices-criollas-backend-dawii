@@ -16,6 +16,13 @@ spring:
               predicates:
                 - Path=/api/auth/**
 
+            - id: auth-internal
+              uri: lb://raices-criollas-auth
+              predicates:
+                - Path=/api/auth-internal/**
+              filters:
+                - RewritePath=/api/auth-internal/(?<segment>.*), /internal/${segment}
+
             - id: menu
               uri: lb://raices-criollas-menu
               predicates:
@@ -33,6 +40,13 @@ spring:
               uri: lb://raices-criollas-pedidos
               predicates:
               - Path=/api/pedidos/**
+              filters:
+                - StripPrefix=1
+
+            - id: payment
+              uri: lb://raices-criollas-payment
+              predicates:
+                - Path=/api/payment/**
               filters:
                 - StripPrefix=2
             # Plantilla para los demás microservicios

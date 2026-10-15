@@ -26,6 +26,8 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
 import com.raicescriollas.menu.dto.PlatoDTO;
+import com.raicescriollas.menu.dto.PlatoPublicoDTO;
+import com.raicescriollas.menu.dto.StockItemDTO;
 import com.raicescriollas.menu.entity.Plato;
 import com.raicescriollas.menu.service.ImagenService;
 import com.raicescriollas.menu.service.PlatoService;
@@ -61,10 +63,10 @@ public class PlatoController {
             @RequestParam(required = false) BigDecimal precioMin,
             @RequestParam(required = false) BigDecimal precioMax) {
 
-        List<PlatoDTO> listaDTO = service
+        List<PlatoPublicoDTO> listaDTO = service
                 .buscarDisponibles(nombre, categoriaId, precioMin, precioMax)
                 .stream()
-                .map(p -> mapper.map(p, PlatoDTO.class))
+                .map(p -> mapper.map(p, PlatoPublicoDTO.class))
                 .toList();
 
         return ResponseEntity.ok(
@@ -73,9 +75,9 @@ public class PlatoController {
 
     @GetMapping("/destacados")
     public ResponseEntity<ApiResponse<?>> listarDestacados() {
-        List<PlatoDTO> listaDTO = service.listarDestacados()
+        List<PlatoPublicoDTO> listaDTO = service.listarDestacados()
                 .stream()
-                .map(p -> mapper.map(p, PlatoDTO.class))
+                .map(p -> mapper.map(p, PlatoPublicoDTO.class))
                 .toList();
 
         return ResponseEntity.ok(
@@ -92,7 +94,7 @@ public class PlatoController {
         }
 
         return ResponseEntity.ok(
-                new ApiResponse<>(true, "Plato encontrado", mapper.map(plato, PlatoDTO.class)));
+                new ApiResponse<>(true, "Plato encontrado", mapper.map(plato, PlatoPublicoDTO.class)));
     }
 
     // Endpoints administrativos
@@ -197,6 +199,66 @@ public class PlatoController {
         service.quitarDestacado(id);
         return ResponseEntity.ok(
                 new ApiResponse<>(true, "Plato quitado de destacados", null));
+    }
+
+    /**
+     * Reduce el stock de un plato. Si llega a 0 se desactiva automáticamente.
+     * Solo accesible por administradores — el descuento por pedidos llega vía RabbitMQ.
+     */
+    @PutMapping("/{id}/reducir-stock")
+    @PreAuthorize("hasAuthority('ROLE_ADMIN')")
+    public ResponseEntity<ApiResponse<?>> reducirStock(
+            @PathVariable Long id,
+            @RequestParam int cantidad) throws Exception {
+
+        Plato actualizado = service.reducirStock(id, cantidad);
+        return ResponseEntity.ok(
+                new ApiResponse<>(true, "Stock reducido correctamente",
+                        mapper.map(actualizado, PlatoDTO.class)));
+    }
+
+    /**
+     * Repone stock de un plato. Si el plato estaba desactivado por stock 0,
+     * se reactiva automáticamente.
+     */
+    @PutMapping("/{id}/reponer-stock")
+    @PreAuthorize("hasAuthority('ROLE_ADMIN')")
+    public ResponseEntity<ApiResponse<?>> reponerStock(
+            @PathVariable Long id,
+            @RequestParam int cantidad) throws Exception {
+
+        Plato actualizado = service.reponerStock(id, cantidad);
+        return ResponseEntity.ok(
+                new ApiResponse<>(true, "Stock repuesto correctamente",
+                        mapper.map(actualizado, PlatoDTO.class)));
+    }
+
+    /** Reduce el stock de varios platos a la vez. Solo desde el panel admin — pedidos usa RabbitMQ. */
+    @PutMapping("/stock/reducir")
+    @PreAuthorize("hasAuthority('ROLE_ADMIN')")
+    public ResponseEntity<ApiResponse<?>> reducirStockLote(@RequestBody List<StockItemDTO> items) {
+        service.reducirStock(items);
+        return ResponseEntity.ok(new ApiResponse<>(true, "Stock reducido correctamente", null));
+    }
+
+    /** Devuelve el stock de varios platos a la vez. Solo desde el panel admin — pedidos usa RabbitMQ. */
+    @PutMapping("/stock/reponer")
+    @PreAuthorize("hasAuthority('ROLE_ADMIN')")
+    public ResponseEntity<ApiResponse<?>> reponerStockLote(@RequestBody List<StockItemDTO> items) {
+        service.reponerStock(items);
+        return ResponseEntity.ok(new ApiResponse<>(true, "Stock repuesto correctamente", null));
+    }
+    
+    /**
+     * Revisa si alcanza el stock de varios platos SIN descontar nada.
+     * Lo llama pedidos antes de mandar al cliente a pagar, reenviando el JWT del cliente.
+     * El descuento real sigue llegando por RabbitMQ al aprobarse el pago.
+     */
+    @PutMapping("/stock/verificar")
+    @PreAuthorize("isAuthenticated()")
+    public ResponseEntity<ApiResponse<?>> verificarStock(@RequestBody List<StockItemDTO> items) {
+        service.verificarStock(items);
+        return ResponseEntity.ok(new ApiResponse<>(true, "Stock suficiente", null));
     }
 
     /**

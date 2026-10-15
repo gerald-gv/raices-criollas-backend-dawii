@@ -5,6 +5,7 @@ import com.raicescriollas.pedidos.dto.ApiResponse;
 import feign.FeignException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -19,6 +20,12 @@ public class ApiExceptionHandler {
 		return ResponseEntity.badRequest().body(new ApiResponse<>(false, e.getMessage(), null));
 	}
 
+	// Transicion de estado no permitida, cancelar un pedido que ya no esta recien registrado...
+	@ExceptionHandler(IllegalStateException.class)
+	public ResponseEntity<ApiResponse<Void>> conflict(IllegalStateException e) {
+		return ResponseEntity.status(HttpStatus.CONFLICT).body(new ApiResponse<>(false, e.getMessage(), null));
+	}
+
 	@ExceptionHandler(NoSuchElementException.class)
 	public ResponseEntity<ApiResponse<Void>> missing(NoSuchElementException e) {
 		return ResponseEntity.status(HttpStatus.NOT_FOUND).body(new ApiResponse<>(false, e.getMessage(), null));
@@ -29,6 +36,26 @@ public class ApiExceptionHandler {
 		return ResponseEntity.badRequest().body(new ApiResponse<>(false, "Datos de entrada invalidos", null));
 	}
 
+	// Cuerpo ilegible, p. ej. un estado que no existe en el enum
+	@ExceptionHandler(HttpMessageNotReadableException.class)
+	public ResponseEntity<ApiResponse<Void>> unreadable(HttpMessageNotReadableException e) {
+		return ResponseEntity.badRequest().body(new ApiResponse<>(false, "Cuerpo de la peticion invalido", null));
+	}
+
+	// Menu explica el conflicto de stock («No hay stock suficiente de X...»): se le muestra al cliente
+	@ExceptionHandler(FeignException.Conflict.class)
+	public ResponseEntity<ApiResponse<Void>> menuConflict(FeignException.Conflict e) {
+		String mensaje = "No hay stock suficiente para completar el pedido.";
+		try {
+			var nodo = new com.fasterxml.jackson.databind.ObjectMapper().readTree(e.contentUTF8()).path("mensaje");
+			if (nodo.isTextual() && !nodo.asText().isBlank())
+				mensaje = nodo.asText();
+		} catch (Exception ignorada) {
+			// se queda el mensaje generico
+		}
+		return ResponseEntity.status(HttpStatus.CONFLICT).body(new ApiResponse<>(false, mensaje, null));
+	}
+
 	@ExceptionHandler(FeignException.NotFound.class)
 	public ResponseEntity<ApiResponse<Void>> menuMissing(FeignException.NotFound e) {
 		return ResponseEntity.badRequest()
@@ -37,7 +64,11 @@ public class ApiExceptionHandler {
 
 	@ExceptionHandler(FeignException.class)
 	public ResponseEntity<ApiResponse<Void>> menuError(FeignException e) {
+		// Log completo para diagnóstico — incluye URL, status y body de la respuesta
+		org.slf4j.LoggerFactory.getLogger(ApiExceptionHandler.class)
+				.error("[Feign] status={} url={} body={}", e.status(), e.request() != null ? e.request().url() : "?",
+						e.contentUTF8(), e);
 		return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
-				.body(new ApiResponse<>(false, "No se pudo consultar el microservicio Menu", null));
+				.body(new ApiResponse<>(false, "No se pudo consultar el microservicio Menu [" + e.status() + "]", null));
 	}
 }

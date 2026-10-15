@@ -1,5 +1,5 @@
 server:
-  port: 8083
+  port: 8084
 spring:
   application:
     name: raices-criollas-pedidos
@@ -12,9 +12,19 @@ spring:
       ddl-auto: update
     show-sql: true
     open-in-view: false
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USER:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
 app:
   jwt:
     secret: ${JWT_SECRET}
+  internal:
+    secret: ${INTERNAL_SECRET:antiCibertec}
+  expiracion:
+    pedido-pendiente-minutos: 30
+    carrito-dias: 1
 eureka:
   instance:
     hostname: ${EUREKA_HOSTNAME:localhost}
@@ -23,3 +33,4 @@ eureka:
     fetch-registry: true
     service-url:
       defaultZone: ${EUREKA_URL:http://localhost:8761/eureka}
+

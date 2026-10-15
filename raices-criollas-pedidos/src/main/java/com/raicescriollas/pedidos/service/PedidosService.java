@@ -1,37 +1,62 @@
 package com.raicescriollas.pedidos.service;
 
+import com.raicescriollas.pedidos.client.AuthClient;
 import com.raicescriollas.pedidos.client.PlatoClient;
 
 import com.raicescriollas.pedidos.dto.*;
 import com.raicescriollas.pedidos.entity.*;
+import com.raicescriollas.pedidos.enums.EstadoPedido;
+import com.raicescriollas.pedidos.messaging.PedidoEventPublisher;
 import com.raicescriollas.pedidos.repository.*;
+import com.raicescriollas.pedidos.utils.SecurityUtils;
+
+import feign.FeignException;
+
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Optional;
+
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 
 @Service
 public class PedidosService {
-	
+
+	private static final int MAX_CANTIDAD = 99;
+	private static final int MAX_PAGE_SIZE = 50;
+
 	private final CarritoRepository carritos;
 	private final PedidoRepository pedidos;
 	private final PlatoClient menu;
+	private final AuthClient auth;
+	private final PedidoEventPublisher eventPublisher;
 
-	public PedidosService(CarritoRepository carritos, PedidoRepository pedidos, PlatoClient menu) {
+	public PedidosService(CarritoRepository carritos, PedidoRepository pedidos, PlatoClient menu,
+			AuthClient auth, PedidoEventPublisher eventPublisher) {
 		this.carritos = carritos;
 		this.pedidos = pedidos;
 		this.menu = menu;
+		this.auth = auth;
+		this.eventPublisher = eventPublisher;
 	}
+
+	// Carrito 
 
 	@Transactional(readOnly = true)
 	public CarritoResponse verCarrito(Long clienteId) {
 		validarCliente(clienteId);
 		return carritos.findByClienteId(clienteId).map(this::mapCarrito)
-				.orElse(new CarritoResponse(clienteId, List.of()));
+				.orElse(new CarritoResponse(clienteId, List.of(), BigDecimal.ZERO));
 	}
 
 	@Transactional
@@ -57,8 +82,63 @@ public class PedidosService {
 			item.setPlatoId(request.platoId());
 			item.setCantidad(request.cantidad());
 			carrito.getItems().add(item);
-		} else
-			item.setCantidad(Math.addExact(item.getCantidad(), request.cantidad()));
+		} else {
+			int suma = Math.addExact(item.getCantidad(), request.cantidad());
+			if (suma > MAX_CANTIDAD)
+				throw new IllegalArgumentException("Maximo " + MAX_CANTIDAD + " unidades por plato");
+			item.setCantidad(suma);
+		}
+		tocar(carrito);
+		return mapCarrito(carritos.save(carrito));
+	}
+
+	// Sincroniza el carrito con lo que el cliente dejo en pantalla
+	@Transactional
+	public CarritoResponse reemplazarCarrito(Long clienteId, List<AgregarItemRequest> nuevos) {
+		validarCliente(clienteId);
+
+		Map<Long, Integer> cantidades = new LinkedHashMap<>();
+		for (AgregarItemRequest i : nuevos) {
+			if (i.platoId() <= 0)
+				throw new IllegalArgumentException("platoId debe ser positivo");
+			if (cantidades.merge(i.platoId(), i.cantidad(), Integer::sum) > MAX_CANTIDAD)
+				throw new IllegalArgumentException("Maximo " + MAX_CANTIDAD + " unidades por plato");
+		}
+
+		if (cantidades.isEmpty())
+			return vaciar(clienteId);
+
+		Carrito carrito = carritos.findByClienteId(clienteId).orElseGet(() -> {
+			Carrito c = new Carrito();
+			c.setClienteId(clienteId);
+			return c;
+		});
+
+		carrito.getItems().removeIf(i -> !cantidades.containsKey(i.getPlatoId()));
+		for (ItemCarrito actual : carrito.getItems())
+			actual.setCantidad(cantidades.remove(actual.getPlatoId()));
+		cantidades.forEach((platoId, cantidad) -> {
+			ItemCarrito item = new ItemCarrito();
+			item.setCarrito(carrito);
+			item.setPlatoId(platoId);
+			item.setCantidad(cantidad);
+			carrito.getItems().add(item);
+		});
+
+		tocar(carrito);
+		return mapCarrito(carritos.save(carrito));
+	}
+
+	// Fija la cantidad exacta de un plato
+	@Transactional
+	public CarritoResponse actualizarCantidad(Long clienteId, Long platoId, int cantidad) {
+		validarCliente(clienteId);
+		Carrito carrito = carritos.findByClienteId(clienteId)
+				.orElseThrow(() -> new NoSuchElementException("Carrito no encontrado"));
+		ItemCarrito item = carrito.getItems().stream().filter(i -> i.getPlatoId().equals(platoId)).findFirst()
+				.orElseThrow(() -> new NoSuchElementException("Plato no encontrado en el carrito"));
+		item.setCantidad(cantidad);
+		tocar(carrito);
 		return mapCarrito(carritos.save(carrito));
 	}
 
@@ -70,9 +150,21 @@ public class PedidosService {
 		boolean eliminado = carrito.getItems().removeIf(i -> i.getPlatoId().equals(platoId));
 		if (!eliminado)
 			throw new NoSuchElementException("Plato no encontrado en el carrito");
+		tocar(carrito);
 		return mapCarrito(carritos.save(carrito));
 	}
 
+	@Transactional
+	public CarritoResponse vaciar(Long clienteId) {
+		validarCliente(clienteId);
+		carritos.findByClienteId(clienteId).ifPresent(carritos::delete);
+		return new CarritoResponse(clienteId, List.of(), BigDecimal.ZERO);
+	}
+
+	// ---------- Continuar compra ----------
+
+	// Crea el pedido PENDIENTE_PAGO con los precios de hoy. No descuenta stock (eso lo hace RabbitMQ al pagarse),
+	// pero SI revisa que alcance, para no mandar al cliente a pagar algo que no hay.
 	@Transactional
 	public PedidoResponse confirmar(Long clienteId) {
 		validarCliente(clienteId);
@@ -80,9 +172,10 @@ public class PedidosService {
 				.orElseThrow(() -> new IllegalArgumentException("Carrito vacio"));
 		if (carrito.getItems().isEmpty())
 			throw new IllegalArgumentException("Carrito vacio");
+
 		Pedido pedido = new Pedido();
 		pedido.setClienteId(clienteId);
-		pedido.setEstado("REGISTRADO");
+		pedido.setEstado(EstadoPedido.PENDIENTE_PAGO.name());
 		pedido.setFecha(LocalDateTime.now());
 		BigDecimal total = BigDecimal.ZERO;
 		for (ItemCarrito item : carrito.getItems()) {
@@ -98,14 +191,99 @@ public class PedidosService {
 			pedido.getDetalles().add(detalle);
 		}
 		pedido.setTotal(total);
-		Pedido guardado = pedidos.save(pedido);
-		carritos.delete(carrito);
-		return mapPedido(guardado);
+
+		// Direccion de entrega: se lee del perfil del cliente (no la manda el navegador) y se copia al pedido
+		copiarDireccion(pedido);
+
+		// Si no alcanza el stock, falla aqui (409 con el motivo) y no se crea ni se cancela nada
+		verificarStock(pedido);
+
+		// Si el cliente vuelve a continuar con lo mismo, se reutiliza el pedido pendiente (misma clave de pago en MP);
+		// cualquier otro pendiente distinto se cancela
+		Pedido reutilizable = null;
+		for (Pedido previo : pedidos.findByClienteIdAndEstado(clienteId, EstadoPedido.PENDIENTE_PAGO.name())) {
+			if (reutilizable == null && mismoContenido(previo, pedido)) {
+				reutilizable = previo;
+			} else {
+				previo.setEstado(EstadoPedido.CANCELADO.name());
+			}
+		}
+
+		if (reutilizable != null) {
+			// Vuelve a empezar el plazo de pago (si no, podria vencer mientras el cliente paga)
+			reutilizable.setFecha(LocalDateTime.now());
+			return mapPedido(pedidos.save(reutilizable));
+		}
+		return mapPedido(pedidos.save(pedido));
 	}
 
+	// Lee la direccion del perfil con el JWT del cliente. Sin direccion o sin telefono no hay pedido
+	private void copiarDireccion(Pedido pedido) {
+		AuthClient.PerfilData perfil;
+		try {
+			AuthClient.PerfilResponse r = auth.perfil(SecurityUtils.getCurrentBearer());
+			perfil = r == null ? null : r.data();
+		} catch (FeignException e) {
+			throw new IllegalStateException("No se pudo verificar tu dirección de entrega. Inténtalo de nuevo.");
+		}
+		if (perfil == null || vacio(perfil.direccion()) || vacio(perfil.distrito()) || vacio(perfil.telefono()))
+			throw new IllegalArgumentException("Registra tu dirección de entrega y un teléfono de contacto para continuar.");
+
+		StringBuilder direccion = new StringBuilder(perfil.direccion().trim()).append(", ").append(perfil.distrito().trim());
+		if (!vacio(perfil.referencia()))
+			direccion.append(" (Ref: ").append(perfil.referencia().trim()).append(")");
+		pedido.setDireccionEntrega(direccion.toString());
+		pedido.setTelefonoContacto(perfil.telefono().trim());
+	}
+
+	private boolean vacio(String valor) {
+		return valor == null || valor.isBlank();
+	}
+
+	// Para "Pagar ahora" en un pedido que quedo pendiente: revisa el stock de ESE pedido antes de ir a Mercado Pago
 	@Transactional(readOnly = true)
-	public PedidoResponse buscarPedido(Long id) {
-		return mapPedido(pedidos.findById(id).orElseThrow(() -> new NoSuchElementException("Pedido no encontrado")));
+	public void verificarStockPedido(Long id, Long clienteId, String bearer) {
+		Pedido pedido = buscarVisible(id, clienteId, false);
+		if (estadoDe(pedido) != EstadoPedido.PENDIENTE_PAGO)
+			throw new IllegalStateException("El pedido no esta pendiente de pago");
+		menu.verificarStock(bearer, itemsDe(pedido));
+	}
+
+	private void verificarStock(Pedido pedido) {
+		menu.verificarStock(SecurityUtils.getCurrentBearer(), itemsDe(pedido));
+	}
+
+	private List<PlatoClient.ItemStock> itemsDe(Pedido pedido) {
+		List<PlatoClient.ItemStock> items = new ArrayList<>();
+		for (DetallePedido d : pedido.getDetalles())
+			items.add(new PlatoClient.ItemStock(d.getPlatoId(), d.getCantidad()));
+		return items;
+	}
+
+	private boolean mismoContenido(Pedido a, Pedido b) {
+		// Otra direccion o telefono = otro pedido (no se reutiliza uno con la direccion vieja)
+		if (!java.util.Objects.equals(a.getDireccionEntrega(), b.getDireccionEntrega())
+				|| !java.util.Objects.equals(a.getTelefonoContacto(), b.getTelefonoContacto()))
+			return false;
+		if (a.getDetalles().size() != b.getDetalles().size())
+			return false;
+		for (DetallePedido da : a.getDetalles()) {
+			boolean igual = b.getDetalles().stream()
+					.anyMatch(db -> db.getPlatoId().equals(da.getPlatoId())
+							&& db.getCantidad().equals(da.getCantidad())
+							&& db.getPrecioUnitario().compareTo(da.getPrecioUnitario()) == 0);
+			if (!igual)
+				return false;
+		}
+		return true;
+	}
+
+	// Pedidos del cliente 
+
+	// Un pedido ajeno responde igual que uno inexistente (404)
+	@Transactional(readOnly = true)
+	public PedidoResponse buscarPedido(Long id, Long clienteId, boolean admin) {
+		return mapPedido(buscarVisible(id, clienteId, admin));
 	}
 
 	@Transactional(readOnly = true)
@@ -117,12 +295,135 @@ public class PedidosService {
 		return resultado;
 	}
 
+	@Transactional
+	public PedidoResponse cancelarMiPedido(Long id, Long clienteId) {
+		Pedido pedido = buscarVisible(id, clienteId, false);
+		if (estadoDe(pedido) != EstadoPedido.PENDIENTE_PAGO)
+			throw new IllegalStateException("Solo se puede cancelar un pedido que aun no se ha pagado");
+		pedido.setEstado(EstadoPedido.CANCELADO.name());
+		return mapPedido(pedidos.save(pedido));
+	}
+
+	// Panel administrativo
+
+	@Transactional(readOnly = true)
+	public PaginaResponse<PedidoResponse> listarTodos(String estado, int page, int size) {
+		EstadoPedido filtro = null;
+		if (estado != null && !estado.isBlank()) {
+			try {
+				filtro = EstadoPedido.valueOf(estado.trim().toUpperCase());
+			} catch (IllegalArgumentException e) {
+				throw new IllegalArgumentException("Estado no valido: " + estado);
+			}
+		}
+		Pageable pageable = PageRequest.of(Math.max(page, 0), Math.min(Math.max(size, 1), MAX_PAGE_SIZE),
+				Sort.by(Sort.Direction.DESC, "fecha", "id"));
+		Page<Pedido> resultado = filtro == null ? pedidos.findAll(pageable)
+				: pedidos.findByEstado(filtro.name(), pageable);
+		List<PedidoResponse> contenido = new ArrayList<>();
+		for (Pedido p : resultado.getContent())
+			contenido.add(mapPedido(p));
+		return new PaginaResponse<>(contenido, resultado.getTotalElements(), resultado.getTotalPages(),
+				resultado.getNumber(), resultado.getSize());
+	}
+
+	@Transactional
+	public PedidoResponse cambiarEstado(Long id, EstadoPedido nuevo) {
+		Pedido pedido = pedidos.findById(id).orElseThrow(() -> new NoSuchElementException("Pedido no encontrado"));
+		EstadoPedido actual = estadoDe(pedido);
+
+		// PAGADO lo pondra el microservicio de pagos (ahi se descuenta el stock)
+		if (nuevo == EstadoPedido.PAGADO)
+			throw new IllegalStateException("El pago lo confirma el sistema de pagos; no se puede marcar manualmente");
+		if (!actual.puedePasarA(nuevo))
+			throw new IllegalStateException("No se puede pasar de " + actual + " a " + nuevo);
+
+		pedido.setEstado(nuevo.name());
+		Pedido guardado = pedidos.save(pedido);
+
+		
+		return mapPedido(guardado);
+	}
+
+	// Lo llama el microservicio de pagos cuando Mercado Pago aprueba el cobro
+	@Transactional
+	public PedidoResponse marcarPagado(Long id) {
+		Pedido pedido = pedidos.findByIdParaActualizar(id)
+				.orElseThrow(() -> new NoSuchElementException("Pedido no encontrado"));
+		EstadoPedido actual = estadoDe(pedido);
+
+		if (actual == EstadoPedido.CANCELADO)
+			throw new IllegalStateException("El pedido fue cancelado");
+
+		// Aviso repetido (Mercado Pago reintenta): el pedido ya estaba pagado, no se descuenta dos veces
+		if (actual != EstadoPedido.PENDIENTE_PAGO)
+			return mapPedido(pedido);
+
+		pedido.setEstado(EstadoPedido.PAGADO.name());
+		Pedido guardado = pedidos.save(pedido);
+
+		// El pedido está confirmado y pagado: el carrito ya no tiene utilidad
+		carritos.findByClienteId(pedido.getClienteId()).ifPresent(carritos::delete);
+
+		// Publica el evento pedido.pagado → RabbitMQ → menu-service descuenta el stock de forma asíncrona
+		eventPublisher.publicarPedidoPagado(guardado);
+
+		return mapPedido(guardado);
+	}
+
+	// Expiracion
+
+	// Pedidos que nadie pago, se cancelan
+	@Transactional
+	public int expirarPedidosPendientes(LocalDateTime limite) {
+		List<Pedido> vencidos = pedidos.findByEstadoAndFechaBefore(EstadoPedido.PENDIENTE_PAGO.name(), limite);
+		for (Pedido p : vencidos)
+			p.setEstado(EstadoPedido.CANCELADO.name());
+		return vencidos.size();
+	}
+
+	// Carritos que el cliente abandono
+	@Transactional
+	public int expirarCarritos(LocalDateTime limite) {
+		List<Carrito> abandonados = carritos.findByActualizadoEnBefore(limite);
+		carritos.deleteAll(abandonados);
+		return abandonados.size();
+	}
+
+	// Utilidades 
+
+	private Pedido buscarVisible(Long id, Long clienteId, boolean admin) {
+		return pedidos.findById(id).filter(p -> admin || p.getClienteId().equals(clienteId))
+				.orElseThrow(() -> new NoSuchElementException("Pedido no encontrado"));
+	}
+
+	private EstadoPedido estadoDe(Pedido pedido) {
+		return EstadoPedido.valueOf(pedido.getEstado());
+	}
+
+	private void tocar(Carrito carrito) {
+		carrito.setActualizadoEn(LocalDateTime.now());
+	}
+
+	// para agregar y continuar la compra, el plato debe existir y estar disponible
 	private PlatoClient.PlatoData consultarPlato(Long id) {
 		PlatoClient.MenuResponse r = menu.obtenerPlato(id);
-		if (r == null || !r.success() || r.data() == null || !Boolean.TRUE.equals(r.data().disponible())
-				|| r.data().precio() == null || r.data().precio().signum() <= 0)
+		if (r == null || !r.success() || r.data() == null)
 			throw new IllegalArgumentException("El plato no esta disponible");
-		return r.data();
+		PlatoClient.PlatoData plato = r.data();
+		if (!Boolean.TRUE.equals(plato.disponible()) || plato.precio() == null || plato.precio().signum() <= 0)
+			throw new IllegalArgumentException("El plato \"" + plato.nombre() + "\" no esta disponible");
+		return plato;
+	}
+
+	// para VER el carrito, un plato retirado o un fallo de Menu no debe romper todo el carrito
+	private Optional<PlatoClient.PlatoData> buscarPlato(Long id) {
+		try {
+			PlatoClient.MenuResponse r = menu.obtenerPlato(id);
+			return r != null && r.success() ? Optional.ofNullable(r.data()) : Optional.empty();
+		} catch (FeignException e) {
+			return Optional.empty();
+		}
 	}
 
 	private void validarCliente(Long id) {
@@ -132,9 +433,20 @@ public class PedidosService {
 
 	private CarritoResponse mapCarrito(Carrito c) {
 		List<ItemCarritoResponse> items = new ArrayList<>();
-		for (ItemCarrito i : c.getItems())
-			items.add(new ItemCarritoResponse(i.getPlatoId(), i.getCantidad()));
-		return new CarritoResponse(c.getClienteId(), items);
+		BigDecimal total = BigDecimal.ZERO;
+		for (ItemCarrito i : c.getItems()) {
+			Optional<PlatoClient.PlatoData> plato = buscarPlato(i.getPlatoId());
+			BigDecimal precio = plato.map(PlatoClient.PlatoData::precio).orElse(null);
+			boolean disponible = plato.isPresent() && Boolean.TRUE.equals(plato.get().disponible()) && precio != null
+					&& precio.signum() > 0;
+			BigDecimal subtotal = precio == null ? null : precio.multiply(BigDecimal.valueOf(i.getCantidad()));
+			if (disponible)
+				total = total.add(subtotal);
+			items.add(new ItemCarritoResponse(i.getPlatoId(), i.getCantidad(),
+					plato.map(PlatoClient.PlatoData::nombre).orElse(null),
+					plato.map(PlatoClient.PlatoData::imagen).orElse(null), precio, subtotal, disponible));
+		}
+		return new CarritoResponse(c.getClienteId(), items, total);
 	}
 
 	private PedidoResponse mapPedido(Pedido p) {
@@ -142,6 +454,7 @@ public class PedidosService {
 		for (DetallePedido d : p.getDetalles())
 			detalles.add(new DetallePedidoResponse(d.getPlatoId(), d.getNombrePlato(), d.getCantidad(),
 					d.getPrecioUnitario(), d.getSubtotal()));
-		return new PedidoResponse(p.getId(), p.getClienteId(), p.getFecha(), p.getEstado(), p.getTotal(), detalles);
+		return new PedidoResponse(p.getId(), p.getClienteId(), p.getFecha(), p.getEstado(), p.getTotal(),
+				p.getDireccionEntrega(), p.getTelefonoContacto(), detalles);
 	}
 }
