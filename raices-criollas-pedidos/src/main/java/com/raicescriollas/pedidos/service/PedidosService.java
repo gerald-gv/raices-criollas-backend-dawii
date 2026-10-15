@@ -209,12 +209,20 @@ public class PedidosService {
 			}
 		}
 
+		Pedido guardado;
 		if (reutilizable != null) {
 			// Vuelve a empezar el plazo de pago (si no, podria vencer mientras el cliente paga)
 			reutilizable.setFecha(LocalDateTime.now());
-			return mapPedido(pedidos.save(reutilizable));
+			guardado = pedidos.save(reutilizable);
+		} else {
+			guardado = pedidos.save(pedido);
 		}
-		return mapPedido(pedidos.save(pedido));
+
+		// El pedido conserva sus detalles; el carrito ya no se necesita.
+		// @Transactional asegura que guardar el pedido y vaciar el carrito sean una sola operacion.
+		PedidoResponse respuesta = mapPedido(guardado);
+		carritos.delete(carrito);
+		return respuesta;
 	}
 
 	// Lee la direccion del perfil con el JWT del cliente. Sin direccion o sin telefono no hay pedido
@@ -362,8 +370,7 @@ public class PedidosService {
 		pedido.setEstado(EstadoPedido.PAGADO.name());
 		Pedido guardado = pedidos.save(pedido);
 
-		// El pedido está confirmado y pagado: el carrito ya no tiene utilidad
-		carritos.findByClienteId(pedido.getClienteId()).ifPresent(carritos::delete);
+		// No borrar el carrito aqui: el cliente podria haber creado uno nuevo desde la confirmacion.
 
 		// Publica el evento pedido.pagado → RabbitMQ → menu-service descuenta el stock de forma asíncrona
 		eventPublisher.publicarPedidoPagado(guardado);
