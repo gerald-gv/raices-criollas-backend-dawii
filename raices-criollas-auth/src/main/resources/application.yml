@@ -10,7 +10,7 @@ spring:
     password: "${DB_PASSWORD:YOUR_PASSWORD}"
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: validate
     show-sql: true
     properties:
       hibernate:
@@ -21,6 +21,8 @@ app:
     issuer: auth-service
     access-token-minutes: 120
     secret: "${JWT_SECRET}"
+  internal:
+    secret: ${INTERNAL_SECRET:antiCibertec}
 
 eureka:
   instance:
