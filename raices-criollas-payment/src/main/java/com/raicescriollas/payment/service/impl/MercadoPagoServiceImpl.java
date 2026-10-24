@@ -1,24 +1,35 @@
 package com.raicescriollas.payment.service.impl;
 
 import com.mercadopago.client.payment.PaymentClient;
+import com.mercadopago.client.payment.PaymentRefundClient;
 import com.mercadopago.client.preference.PreferenceBackUrlsRequest;
 import com.mercadopago.client.preference.PreferenceClient;
 import com.mercadopago.client.preference.PreferenceItemRequest;
 import com.mercadopago.client.preference.PreferenceRequest;
+import com.mercadopago.core.MPRequestOptions;
 import com.mercadopago.exceptions.MPApiException;
 import com.mercadopago.exceptions.MPException;
+import com.mercadopago.net.MPResultsResourcesPage;
+import com.mercadopago.net.MPSearchRequest;
 import com.mercadopago.resources.payment.Payment;
+import com.mercadopago.resources.payment.PaymentRefund;
 import com.mercadopago.resources.preference.Preference;
 import com.raicescriollas.payment.dto.PagoMP;
 import com.raicescriollas.payment.dto.PreferenciaCreada;
+import com.raicescriollas.payment.dto.ReembolsoMP;
 import com.raicescriollas.payment.entity.Pago;
+import com.raicescriollas.payment.entity.TipoOrigen;
 import com.raicescriollas.payment.exception.PasarelaPagoException;
 import com.raicescriollas.payment.service.IMercadoPagoService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.math.BigDecimal;
+import java.time.OffsetDateTime;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 @Slf4j
@@ -32,11 +43,15 @@ public class MercadoPagoServiceImpl implements IMercadoPagoService {
     private String publicUrl;
 
     @Override
-    public PreferenciaCreada crearPreferencia(Pago pago) {
+    public PreferenciaCreada crearPreferencia(Pago pago, OffsetDateTime venceEn) {
         try {
+            boolean esReserva = pago.getTipo() == TipoOrigen.RESERVA;
+            Long origenId = esReserva ? pago.getReservaId() : pago.getPedidoId();
+            String origen = esReserva ? "Reserva" : "Pedido";
+
             PreferenceItemRequest item = PreferenceItemRequest.builder()
-                    .id(String.valueOf(pago.getPedidoId()))
-                    .title("Pedido #" + pago.getPedidoId() + " - Raices Criollas")
+                    .id(String.valueOf(origenId))
+                    .title(origen + " #" + origenId + " - Raices Criollas")
                     .quantity(1)
                     .currencyId(pago.getMoneda())
                     .unitPrice(pago.getMonto())
@@ -55,14 +70,17 @@ public class MercadoPagoServiceImpl implements IMercadoPagoService {
             PreferenceRequest request = PreferenceRequest.builder()
                     .items(List.of(item))
                     .backUrls(backUrls)
-                    .externalReference(String.valueOf(pago.getId()))
+                    .externalReference(pago.getReferenciaExterna())
                     .notificationUrl(notificationUrl)
+                    .expires(true)
+                    .expirationDateFrom(OffsetDateTime.now())
+                    .expirationDateTo(venceEn)
                     .build();
 
             Preference preference = new PreferenceClient().create(request);
 
-            log.info("Preferencia {} creada para el pago {} con notification_url = {}",
-                    preference.getId(), pago.getId(),
+            log.info("Preferencia {} creada para el pago {} (vence {}) con notification_url = {}",
+                    preference.getId(), pago.getId(), venceEn,
                     notificationUrl == null ? "(vacia)" : notificationUrl);
 
             return new PreferenciaCreada(preference.getId(), preference.getInitPoint());
@@ -100,6 +118,61 @@ public class MercadoPagoServiceImpl implements IMercadoPagoService {
         } catch (MPException e) {
             log.error("Error al comunicarse con Mercado Pago", e);
             throw new PasarelaPagoException();
+        }
+    }
+
+    @Override
+    public List<Long> buscarIdsDePagos(String externalReference) {
+        try {
+            Map<String, Object> filtros = new HashMap<>();
+            filtros.put("external_reference", externalReference);
+            filtros.put("sort", "date_created");
+            filtros.put("criteria", "asc");
+
+            MPSearchRequest busqueda = MPSearchRequest.builder()
+                    .offset(0)
+                    .limit(30)
+                    .filters(filtros)
+                    .build();
+
+            MPResultsResourcesPage<Payment> pagina = new PaymentClient().search(busqueda);
+
+            return pagina.getResults().stream().map(Payment::getId).toList();
+
+        } catch (MPApiException e) {
+            log.error("Error al buscar pagos con la referencia {}. Estado: {} - Respuesta: {}",
+                    externalReference, e.getStatusCode(), e.getApiResponse().getContent());
+            throw new PasarelaPagoException();
+        } catch (MPException e) {
+            log.error("Error al comunicarse con Mercado Pago", e);
+            throw new PasarelaPagoException();
+        }
+    }
+
+    @Override
+    public ReembolsoMP reembolsar(Long mpPaymentId, BigDecimal monto, String idempotencyKey) {
+        try {
+            MPRequestOptions opciones = MPRequestOptions.builder()
+                    .customHeaders(Map.of("X-Idempotency-Key", idempotencyKey))
+                    .build();
+
+            PaymentRefund refund = new PaymentRefundClient().refund(mpPaymentId, monto, opciones);
+
+            log.info("Reembolso {} creado para el pago de MP {}", refund.getId(), mpPaymentId);
+
+            return new ReembolsoMP(
+                    String.valueOf(refund.getId()),
+                    refund.getStatus(),
+                    refund.getAmount(),
+                    refund.getResponse().getContent()
+            );
+        } catch (MPApiException e) {
+            log.error("Mercado Pago rechazo el reembolso del pago {}. Estado: {} - Respuesta: {}",
+                    mpPaymentId, e.getStatusCode(), e.getApiResponse().getContent());
+            throw new PasarelaPagoException("No se pudo procesar el reembolso con Mercado Pago");
+        } catch (MPException e) {
+            log.error("Error al comunicarse con Mercado Pago", e);
+            throw new PasarelaPagoException("No se pudo procesar el reembolso con Mercado Pago");
         }
     }
 }

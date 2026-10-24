@@ -1,10 +1,18 @@
-
+x-tz-java: &tz-java
+  TZ: America/Lima
+  JAVA_TOOL_OPTIONS: -Duser.timezone=America/Lima
+ 
+x-tz-postgres: &tz-postgres
+  TZ: America/Lima
+  PGTZ: America/Lima
+ 
 services:
   postgres-auth:
     image: postgres:18
     container_name: raices-criollas-postgres-auth
     restart: unless-stopped
     environment:
+      <<: *tz-postgres
       POSTGRES_DB: auth_db
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD en .env}
@@ -18,12 +26,13 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-
+ 
   postgres-menu:
     image: postgres:18
     container_name: raices-criollas-postgres-menu
     restart: unless-stopped
     environment:
+      <<: *tz-postgres
       POSTGRES_DB: menu_db
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD en .env}
@@ -37,13 +46,14 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-
+ 
   rabbitmq:
     image: rabbitmq:4-management
     container_name: raices-criollas-rabbitmq
     hostname: rabbit-host
     restart: unless-stopped
     environment:
+      TZ: America/Lima
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-raices_user}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Define RABBITMQ_PASSWORD en .env}
     ports:
@@ -56,7 +66,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-
+ 
   menu:
     build:
       context: ./raices-criollas-menu
@@ -64,6 +74,7 @@ services:
     container_name: raices-criollas-menu
     restart: unless-stopped
     environment:
+      <<: *tz-java
       DB_URL: jdbc:postgresql://postgres-menu:5432/menu_db
       DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD}
@@ -77,8 +88,6 @@ services:
       CLOUDINARY_CLOUD_NAME: ${CLOUDINARY_CLOUD_NAME}
       CLOUDINARY_API_KEY: ${CLOUDINARY_API_KEY}
       CLOUDINARY_API_SECRET: ${CLOUDINARY_API_SECRET}
-    ports:
-      - "8082:8082"
     depends_on:
       postgres-menu:
         condition: service_healthy
@@ -86,16 +95,18 @@ services:
         condition: service_healthy
       eureka:
         condition: service_started
-
+ 
   eureka:
     build:
       context: ./raices-criollas-eureka
       dockerfile: Dockerfile
     container_name: raices-criollas-eureka
     restart: unless-stopped
+    environment:
+      <<: *tz-java
     ports:
       - "8761:8761"
-
+ 
   auth:
     build:
       context: ./raices-criollas-auth
@@ -103,6 +114,7 @@ services:
     container_name: raices-criollas-auth
     restart: unless-stopped
     environment:
+      <<: *tz-java
       DB_URL: jdbc:postgresql://postgres-auth:5432/auth_db
       DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD}
@@ -110,14 +122,12 @@ services:
       INTERNAL_SECRET: ${INTERNAL_SECRET}
       EUREKA_URL: http://eureka:8761/eureka
       EUREKA_HOSTNAME: raices-criollas-auth
-    ports:
-      - "8081:8081"
     depends_on:
       postgres-auth:
         condition: service_healthy
       eureka:
         condition: service_started
-
+ 
   gateway:
     build:
       context: ./raices-criollas-gateway
@@ -125,6 +135,7 @@ services:
     container_name: raices-criollas-gateway
     restart: unless-stopped
     environment:
+      <<: *tz-java
       EUREKA_URL: http://eureka:8761/eureka
       EUREKA_HOSTNAME: raices-criollas-gateway
     ports:
@@ -132,15 +143,16 @@ services:
     depends_on:
       - eureka
       - auth
-
+ 
   postgres-pedidos:
     image: postgres:18
     container_name: raices-criollas-postgres-pedidos
     restart: unless-stopped
     environment:
+      <<: *tz-postgres
       POSTGRES_DB: pedidos_db
       POSTGRES_USER: ${DB_USER:-postgres}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD en .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
       - pedidos_postgres_data:/var/lib/postgresql
     healthcheck:
@@ -148,7 +160,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-
+ 
   pedidos:
     build:
       context: ./raices-criollas-pedidos
@@ -156,6 +168,7 @@ services:
     container_name: raices-criollas-pedidos
     restart: unless-stopped
     environment:
+      <<: *tz-java
       DB_URL: jdbc:postgresql://postgres-pedidos:5432/pedidos_db
       DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD}
@@ -174,10 +187,109 @@ services:
         condition: service_healthy
       eureka:
         condition: service_started
-
-
+ 
+  postgres-reservas:
+    image: postgres:18
+    container_name: raices-criollas-postgres-reservas
+    restart: unless-stopped
+    environment:
+      <<: *tz-postgres
+      POSTGRES_DB: reservas_db
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD en .env}
+    volumes:
+      - reservas_postgres_data:/var/lib/postgresql
+      - ./dbInit/reservas_db.sql:/docker-entrypoint-initdb.d/01-reservas.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+ 
+  reservas:
+    build:
+      context: ./raices-criollas-reservas
+      dockerfile: Dockerfile
+    container_name: raices-criollas-reservas
+    restart: unless-stopped
+    environment:
+      <<: *tz-java
+      DB_URL: jdbc:postgresql://postgres-reservas:5432/reservas_db
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD}
+      EUREKA_URL: http://eureka:8761/eureka
+      EUREKA_HOSTNAME: raices-criollas-reservas
+      JWT_SECRET: ${JWT_SECRET:?Define JWT_SECRET en .env}
+      INTERNAL_SECRET: ${INTERNAL_SECRET:?Define INTERNAL_SECRET en .env}
+    depends_on:
+      postgres-reservas:
+        condition: service_healthy
+      eureka:
+        condition: service_started
+ 
+  postgres-payment:
+    image: postgres:18
+    container_name: raices-criollas-postgres-payment
+    restart: unless-stopped
+    environment:
+      <<: *tz-postgres
+      POSTGRES_DB: payment_db
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD en .env}
+    volumes:
+      - payment_postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+ 
+  payment:
+    build:
+      context: ./raices-criollas-payment
+      dockerfile: Dockerfile
+    container_name: raices-criollas-payment
+    restart: unless-stopped
+    environment:
+      <<: *tz-java
+      DB_URL: jdbc:postgresql://postgres-payment:5432/payment_db
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      INTERNAL_SECRET: ${INTERNAL_SECRET}
+      MP_ACCESS_TOKEN: ${MP_ACCESS_TOKEN:?Define MP_ACCESS_TOKEN en .env}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      EUREKA_URL: http://eureka:8761/eureka
+      EUREKA_HOSTNAME: raices-criollas-payment
+    depends_on:
+      postgres-payment:
+        condition: service_healthy
+      eureka:
+        condition: service_started
+ 
+  web:
+    build:
+      context: ./raices-criollas-web
+      dockerfile: Dockerfile
+      args:
+        CLOUDINARY_CLOUD_NAME: ${CLOUDINARY_CLOUD_NAME}
+        CLOUDINARY_HOSTNAME: ${CLOUDINARY_HOSTNAME:-res.cloudinary.com}
+    container_name: raices-criollas-web
+    restart: unless-stopped
+    environment:
+      TZ: America/Lima
+      API_URL: http://gateway:8080
+      CLOUDINARY_CLOUD_NAME: ${CLOUDINARY_CLOUD_NAME}
+      CLOUDINARY_HOSTNAME: ${CLOUDINARY_HOSTNAME:-res.cloudinary.com}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - gateway
+ 
 volumes:
   auth_postgres_data:
   menu_postgres_data:
   rabbitmq_data:
   pedidos_postgres_data:
+  reservas_postgres_data:
+  payment_postgres_data:
