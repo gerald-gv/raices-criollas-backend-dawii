@@ -19,7 +19,7 @@ spring:
 app:
   sync:
     activo: ${SYNC_ACTIVO:true}
-    intervalo-ms: ${SYNC_INTERVALO_MS:30000}
+    intervalo-ms: ${SYNC_INTERVALO_MS:10000}
     ventana-minutos: ${SYNC_VENTANA_MINUTOS:35}
   pedidos:
     vigencia-minutos: ${PEDIDO_VIGENCIA_MINUTOS:30}
