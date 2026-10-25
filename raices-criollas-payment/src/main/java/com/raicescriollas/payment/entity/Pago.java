@@ -17,9 +17,13 @@ import lombok.NoArgsConstructor;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.UUID;
 
 @Entity
-@Table(name = "pagos", indexes = @Index(name = "idx_pagos_pedido_id", columnList = "pedido_id"))
+@Table(name = "pagos", indexes = {
+        @Index(name = "idx_pagos_pedido_id", columnList = "pedido_id"),
+        @Index(name = "idx_pagos_reserva_id", columnList = "reserva_id")
+})
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
@@ -29,8 +33,16 @@ public class Pago {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(name = "pedido_id", nullable = false)
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 10)
+    @Builder.Default
+    private TipoOrigen tipo = TipoOrigen.PEDIDO;
+
+    @Column(name = "pedido_id")
     private Long pedidoId;
+
+    @Column(name = "reserva_id")
+    private Long reservaId;
 
     @Column(name = "usuario_id", nullable = false)
     private Long usuarioId;
@@ -56,6 +68,10 @@ public class Pago {
     @Column(name = "url_pago", length = 500)
     private String urlPago;
 
+    @Column(name = "referencia_externa", unique = true, length = 36)
+    @Builder.Default
+    private String referenciaExterna = UUID.randomUUID().toString();
+
     @Column(name = "idempotency_key", nullable = false, unique = true, length = 100)
     private String idempotencyKey;
 
@@ -66,6 +82,9 @@ public class Pago {
     @Column(name = "actualizado_en", nullable = false)
     @Builder.Default
     private Instant actualizadoEn = Instant.now();
+
+    @Column(name = "vence_en")
+    private Instant venceEn;
 
     @PreUpdate
     void alActualizar() {

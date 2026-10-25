@@ -2,15 +2,18 @@ package com.raicescriollas.reservas.service.impl;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import com.raicescriollas.reservas.config.DateTimeConfig;
 import com.raicescriollas.reservas.dto.CotizacionRequestDTO;
 import com.raicescriollas.reservas.dto.CotizacionResponseDTO;
 import com.raicescriollas.reservas.dto.MesaResponseDTO;
@@ -26,14 +29,12 @@ import com.raicescriollas.reservas.repository.MesaRepository;
 import com.raicescriollas.reservas.repository.ReservaRepository;
 import com.raicescriollas.reservas.service.IReservaService;
 
-import lombok.RequiredArgsConstructor;
-
 @Service
-@RequiredArgsConstructor
 public class ReservaServiceImpl implements IReservaService {
 
     private final ReservaRepository reservaRepository;
     private final MesaRepository mesaRepository;
+    private final Clock clock;
 
     @Value("${app.reservas.tiempo-expiracion-minutos:15}")
     private long tiempoExpiracionMinutos = 15;
@@ -43,6 +44,17 @@ public class ReservaServiceImpl implements IReservaService {
 
     @Value("${app.reservas.tarifa-por-persona-default:5.00}")
     private BigDecimal tarifaPorPersonaDefault = new BigDecimal("5.00");
+
+    @Autowired
+    public ReservaServiceImpl(ReservaRepository reservaRepository, MesaRepository mesaRepository, Clock clock) {
+        this.reservaRepository = reservaRepository;
+        this.mesaRepository = mesaRepository;
+        this.clock = clock != null ? clock : Clock.system(DateTimeConfig.ZONE_LIMA);
+    }
+
+    public ReservaServiceImpl(ReservaRepository reservaRepository, MesaRepository mesaRepository) {
+        this(reservaRepository, mesaRepository, Clock.system(DateTimeConfig.ZONE_LIMA));
+    }
 
     @Override
     @Transactional(readOnly = true)
@@ -68,7 +80,8 @@ public class ReservaServiceImpl implements IReservaService {
         if (!dto.getFechaInicio().isBefore(dto.getFechaFin())) {
             throw new BusinessException("La fecha de inicio debe ser anterior a la fecha de finalización");
         }
-        if (dto.getFechaInicio().isBefore(LocalDateTime.now())) {
+        LocalDateTime ahora = LocalDateTime.now(clock);
+        if (dto.getFechaInicio().isBefore(ahora)) {
             throw new BusinessException("No se puede realizar una reserva en una fecha u hora pasada");
         }
         if (dto.getCantidadPersonas() == null || dto.getCantidadPersonas() <= 0) {
@@ -89,8 +102,6 @@ public class ReservaServiceImpl implements IReservaService {
                     dto.getCantidadPersonas(), mesa.getCapacidad()
             ));
         }
-
-        LocalDateTime ahora = LocalDateTime.now();
 
         // Detección de solapamiento considerando reservas CONFIRMADAS o PENDIENTES NO EXPIRADAS
         boolean solapada = reservaRepository.existsOverlappingReservations(
@@ -169,7 +180,8 @@ public class ReservaServiceImpl implements IReservaService {
         if (reserva.getEstado() == EstadoReserva.COMPLETADA) {
             throw new BusinessException("No se puede cancelar una reserva que ya ha sido completada");
         }
-        if (reserva.getFechaInicio().isBefore(LocalDateTime.now())) {
+        LocalDateTime ahora = LocalDateTime.now(clock);
+        if (reserva.getFechaInicio().isBefore(ahora)) {
             throw new BusinessException("No se puede cancelar una reserva cuya fecha y hora ya ha iniciado o pasado");
         }
 
@@ -213,7 +225,7 @@ public class ReservaServiceImpl implements IReservaService {
         Reserva reserva = reservaRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Reserva no encontrada con ID: " + id));
 
-        LocalDateTime ahora = LocalDateTime.now();
+        LocalDateTime ahora = LocalDateTime.now(clock);
 
         // Si se reactiva a CONFIRMADA o PENDIENTE desde CANCELADA, validar disponibilidad
         if (nuevoEstado != null && (nuevoEstado == EstadoReserva.CONFIRMADA || nuevoEstado == EstadoReserva.PENDIENTE)
@@ -252,6 +264,43 @@ public class ReservaServiceImpl implements IReservaService {
 
     @Override
     @Transactional
+    public ReservaResponseDTO marcarPagada(Long id) {
+        Reserva reserva = reservaRepository.findByIdParaActualizar(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Reserva no encontrada con ID: " + id));
+
+        // Idempotente: si ya esta pagada y confirmada, se devuelve tal cual
+        if (reserva.getEstado() == EstadoReserva.CONFIRMADA
+                && reserva.getEstadoPago() == EstadoPago.PAGADO) {
+            return toDTO(reserva);
+        }
+
+        if (reserva.getEstado() != EstadoReserva.PENDIENTE
+                || reserva.getEstadoPago() != EstadoPago.PENDIENTE) {
+            throw new BusinessException("La reserva no admite pago en su estado actual");
+        }
+
+        LocalDateTime ahora = LocalDateTime.now(clock);
+
+        // Pago tardio: solo se acepta si la mesa sigue libre en ese horario
+        if (reserva.getFechaExpiracionPago() != null && reserva.getFechaExpiracionPago().isBefore(ahora)) {
+            boolean ocupada = reservaRepository.existsOverlappingReservations(
+                    reserva.getMesa().getId(),
+                    reserva.getFechaInicio(),
+                    reserva.getFechaFin(),
+                    ahora,
+                    reserva.getId());
+            if (ocupada) {
+                throw new BusinessException("La reserva expiro y la mesa ya fue tomada por otra reserva");
+            }
+        }
+
+        reserva.setEstado(EstadoReserva.CONFIRMADA);
+        reserva.setEstadoPago(EstadoPago.PAGADO);
+        return toDTO(reservaRepository.save(reserva));
+    }
+
+    @Override
+    @Transactional
     public ReservaResponseDTO cambiarEstado(Long id, EstadoReserva nuevoEstado) {
         return cambiarEstado(id, nuevoEstado, null);
     }
@@ -263,7 +312,8 @@ public class ReservaServiceImpl implements IReservaService {
         if (!inicio.isBefore(fin)) {
             throw new BusinessException("La fecha de inicio debe ser anterior a la fecha de finalización");
         }
-        if (inicio.isBefore(LocalDateTime.now())) {
+        LocalDateTime ahora = LocalDateTime.now(clock);
+        if (inicio.isBefore(ahora)) {
             throw new BusinessException("No se puede realizar una reserva en una fecha u hora pasada");
         }
         if (personas == null || personas <= 0) {
@@ -305,7 +355,7 @@ public class ReservaServiceImpl implements IReservaService {
                     mesa.getId(),
                     inicio,
                     fin,
-                    LocalDateTime.now(),
+                    ahora,
                     null
             );
             if (solapada) {
